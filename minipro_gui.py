@@ -11,6 +11,7 @@ import os
 import re
 import zlib
 import json
+import math
 
 APP_ID = 'org.minipro.gui'
 
@@ -78,6 +79,660 @@ def find_minipro():
         return sys_bin, None, None
 
     return None, None, None
+
+
+# ── Entropy helpers ────────────────────────────────────────────────────────
+
+def _block_entropy(block: bytes) -> float:
+    if not block:
+        return 0.0
+    counts = [0] * 256
+    for b in block:
+        counts[b] += 1
+    n = len(block)
+    h = 0.0
+    for c in counts:
+        if c:
+            p = c / n
+            h -= p * math.log2(p)
+    return h
+
+def _entropy_color(e: float):
+    """Return (r, g, b) for an entropy value 0–8."""
+    t = e / 8.0
+    if t < 0.25:                    # blank / very low
+        return (0.2, 0.35, 0.9)
+    elif t < 0.65:                  # code / data
+        return (0.2 + t, 0.85 - t * 0.3, 0.2)
+    else:                           # compressed / encrypted
+        return (0.9, 0.85 - t * 0.7, 0.1)
+
+
+# ── 6502 / 65C02 disassembler ──────────────────────────────────────────────
+
+# (mnemonic, addressing_mode, byte_length)
+_6502_OPS: dict[int, tuple[str, str, int]] = {
+    0x00:('BRK','imp',1), 0x01:('ORA','idx',2), 0x05:('ORA','zpg',2),
+    0x06:('ASL','zpg',2), 0x08:('PHP','imp',1), 0x09:('ORA','imm',2),
+    0x0A:('ASL','acc',1), 0x0D:('ORA','abs',3), 0x0E:('ASL','abs',3),
+    0x10:('BPL','rel',2), 0x11:('ORA','idy',2), 0x15:('ORA','zpx',2),
+    0x16:('ASL','zpx',2), 0x18:('CLC','imp',1), 0x19:('ORA','aby',3),
+    0x1D:('ORA','abx',3), 0x1E:('ASL','abx',3), 0x20:('JSR','abs',3),
+    0x21:('AND','idx',2), 0x24:('BIT','zpg',2), 0x25:('AND','zpg',2),
+    0x26:('ROL','zpg',2), 0x28:('PLP','imp',1), 0x29:('AND','imm',2),
+    0x2A:('ROL','acc',1), 0x2C:('BIT','abs',3), 0x2D:('AND','abs',3),
+    0x2E:('ROL','abs',3), 0x30:('BMI','rel',2), 0x31:('AND','idy',2),
+    0x35:('AND','zpx',2), 0x36:('ROL','zpx',2), 0x38:('SEC','imp',1),
+    0x39:('AND','aby',3), 0x3D:('AND','abx',3), 0x3E:('ROL','abx',3),
+    0x40:('RTI','imp',1), 0x41:('EOR','idx',2), 0x45:('EOR','zpg',2),
+    0x46:('LSR','zpg',2), 0x48:('PHA','imp',1), 0x49:('EOR','imm',2),
+    0x4A:('LSR','acc',1), 0x4C:('JMP','abs',3), 0x4D:('EOR','abs',3),
+    0x4E:('LSR','abs',3), 0x50:('BVC','rel',2), 0x51:('EOR','idy',2),
+    0x55:('EOR','zpx',2), 0x56:('LSR','zpx',2), 0x58:('CLI','imp',1),
+    0x59:('EOR','aby',3), 0x5D:('EOR','abx',3), 0x5E:('LSR','abx',3),
+    0x60:('RTS','imp',1), 0x61:('ADC','idx',2), 0x65:('ADC','zpg',2),
+    0x66:('ROR','zpg',2), 0x68:('PLA','imp',1), 0x69:('ADC','imm',2),
+    0x6A:('ROR','acc',1), 0x6C:('JMP','ind',3), 0x6D:('ADC','abs',3),
+    0x6E:('ROR','abs',3), 0x70:('BVS','rel',2), 0x71:('ADC','idy',2),
+    0x75:('ADC','zpx',2), 0x76:('ROR','zpx',2), 0x78:('SEI','imp',1),
+    0x79:('ADC','aby',3), 0x7D:('ADC','abx',3), 0x7E:('ROR','abx',3),
+    0x81:('STA','idx',2), 0x84:('STY','zpg',2), 0x85:('STA','zpg',2),
+    0x86:('STX','zpg',2), 0x88:('DEY','imp',1), 0x8A:('TXA','imp',1),
+    0x8C:('STY','abs',3), 0x8D:('STA','abs',3), 0x8E:('STX','abs',3),
+    0x90:('BCC','rel',2), 0x91:('STA','idy',2), 0x94:('STY','zpx',2),
+    0x95:('STA','zpx',2), 0x96:('STX','zpy',2), 0x98:('TYA','imp',1),
+    0x99:('STA','aby',3), 0x9A:('TXS','imp',1), 0x9D:('STA','abx',3),
+    0xA0:('LDY','imm',2), 0xA1:('LDA','idx',2), 0xA2:('LDX','imm',2),
+    0xA4:('LDY','zpg',2), 0xA5:('LDA','zpg',2), 0xA6:('LDX','zpg',2),
+    0xA8:('TAY','imp',1), 0xA9:('LDA','imm',2), 0xAA:('TAX','imp',1),
+    0xAC:('LDY','abs',3), 0xAD:('LDA','abs',3), 0xAE:('LDX','abs',3),
+    0xB0:('BCS','rel',2), 0xB1:('LDA','idy',2), 0xB4:('LDY','zpx',2),
+    0xB5:('LDA','zpx',2), 0xB6:('LDX','zpy',2), 0xB8:('CLV','imp',1),
+    0xB9:('LDA','aby',3), 0xBA:('TSX','imp',1), 0xBC:('LDY','abx',3),
+    0xBD:('LDA','abx',3), 0xBE:('LDX','aby',3), 0xC0:('CPY','imm',2),
+    0xC1:('CMP','idx',2), 0xC4:('CPY','zpg',2), 0xC5:('CMP','zpg',2),
+    0xC6:('DEC','zpg',2), 0xC8:('INY','imp',1), 0xC9:('CMP','imm',2),
+    0xCA:('DEX','imp',1), 0xCC:('CPY','abs',3), 0xCD:('CMP','abs',3),
+    0xCE:('DEC','abs',3), 0xD0:('BNE','rel',2), 0xD1:('CMP','idy',2),
+    0xD5:('CMP','zpx',2), 0xD6:('DEC','zpx',2), 0xD8:('CLD','imp',1),
+    0xD9:('CMP','aby',3), 0xDD:('CMP','abx',3), 0xDE:('DEC','abx',3),
+    0xE0:('CPX','imm',2), 0xE1:('SBC','idx',2), 0xE4:('CPX','zpg',2),
+    0xE5:('SBC','zpg',2), 0xE6:('INC','zpg',2), 0xE8:('INX','imp',1),
+    0xE9:('SBC','imm',2), 0xEA:('NOP','imp',1), 0xEC:('CPX','abs',3),
+    0xED:('SBC','abs',3), 0xEE:('INC','abs',3), 0xF0:('BEQ','rel',2),
+    0xF1:('SBC','idy',2), 0xF5:('SBC','zpx',2), 0xF6:('INC','zpx',2),
+    0xF8:('SED','imp',1), 0xF9:('SBC','aby',3), 0xFD:('SBC','abx',3),
+    0xFE:('INC','abx',3),
+}
+_65C02_EXTRA: dict[int, tuple[str, str, int]] = {
+    0x04:('TSB','zpg',2), 0x0C:('TSB','abs',3), 0x12:('ORA','zpi',2),
+    0x14:('TRB','zpg',2), 0x1A:('INC','acc',1), 0x1C:('TRB','abs',3),
+    0x32:('AND','zpi',2), 0x34:('BIT','zpx',2), 0x3A:('DEC','acc',1),
+    0x3C:('BIT','abx',3), 0x52:('EOR','zpi',2), 0x5A:('PHY','imp',1),
+    0x64:('STZ','zpg',2), 0x72:('ADC','zpi',2), 0x74:('STZ','zpx',2),
+    0x7A:('PLY','imp',1), 0x80:('BRA','rel', 2), 0x89:('BIT','imm',2),
+    0x92:('STA','zpi',2), 0x9C:('STZ','abs',3), 0x9E:('STZ','abx',3),
+    0xB2:('LDA','zpi',2), 0xD2:('CMP','zpi',2), 0xDA:('PHX','imp',1),
+    0xF2:('SBC','zpi',2), 0xFA:('PLX','imp',1),
+}
+
+def _fmt_6502(mn: str, mode: str, raw: bytes, pc: int) -> str:
+    o = raw[1] if len(raw) > 1 else 0
+    w = (raw[1] | raw[2] << 8) if len(raw) > 2 else 0
+    rel = pc + 2 + (o if o < 128 else o - 256)
+    return {
+        'imp': mn,
+        'acc': f'{mn} A',
+        'imm': f'{mn} #${o:02X}',
+        'zpg': f'{mn} ${o:02X}',
+        'zpx': f'{mn} ${o:02X},X',
+        'zpy': f'{mn} ${o:02X},Y',
+        'abs': f'{mn} ${w:04X}',
+        'abx': f'{mn} ${w:04X},X',
+        'aby': f'{mn} ${w:04X},Y',
+        'ind': f'{mn} (${w:04X})',
+        'idx': f'{mn} (${o:02X},X)',
+        'idy': f'{mn} (${o:02X}),Y',
+        'zpi': f'{mn} (${o:02X})',
+        'rel': f'{mn} ${rel:04X}',
+    }.get(mode, f'{mn} ?')
+
+def _disasm_6502(data: bytes, base: int, is_65c02: bool) -> list[tuple[int,str,str]]:
+    ops = dict(_6502_OPS)
+    if is_65c02:
+        ops.update(_65C02_EXTRA)
+    rows, i = [], 0
+    while i < len(data):
+        b = data[i]
+        if b in ops:
+            mn, mode, sz = ops[b]
+            raw = data[i:i+sz]
+            if len(raw) < sz:
+                rows.append((base+i, ' '.join(f'{x:02X}' for x in raw), '???'))
+                break
+            asm = _fmt_6502(mn, mode, raw, base+i)
+        else:
+            raw = data[i:i+1]
+            asm = f'??? (${b:02X})'
+            sz = 1
+        rows.append((base+i, ' '.join(f'{x:02X}' for x in raw), asm))
+        i += sz
+    return rows
+
+def _disasm_ndisasm(data: bytes, base: int, bits: int) -> list[tuple[int,str,str]]:
+    if not shutil.which('ndisasm'):
+        return []
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.bin') as f:
+        f.write(data); tmp = f.name
+    try:
+        r = subprocess.run(
+            ['ndisasm', f'-b{bits}', f'-o{base:#x}', tmp],
+            capture_output=True, text=True, timeout=10)
+        rows = []
+        for line in r.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3:
+                try:
+                    addr = int(parts[0], 16)
+                    rows.append((addr, parts[1], parts[2]))
+                except ValueError:
+                    pass
+        return rows
+    except Exception:
+        return []
+    finally:
+        os.unlink(tmp)
+
+
+# ── Export helpers ─────────────────────────────────────────────────────────
+
+def _to_intel_hex(data: bytes, base: int = 0) -> str:
+    lines, bpl = [], 16
+    for i in range(0, len(data), bpl):
+        chunk = data[i:i+bpl]
+        addr = (base + i) & 0xFFFF
+        rec = [len(chunk), addr >> 8, addr & 0xFF, 0x00] + list(chunk)
+        cs = (-sum(rec)) & 0xFF
+        lines.append(':' + ''.join(f'{b:02X}' for b in rec) + f'{cs:02X}')
+    lines.append(':00000001FF')
+    return '\n'.join(lines)
+
+def _to_srec(data: bytes, base: int = 0) -> str:
+    lines, bpl = [], 16
+    hdr = b'minipro-gui'
+    r = bytes([len(hdr)+3, 0, 0]) + hdr
+    lines.append('S0' + r.hex().upper() + f'{(-sum(r))&0xFF:02X}')
+    for i in range(0, len(data), bpl):
+        chunk = data[i:i+bpl]
+        addr = base + i
+        if addr <= 0xFFFF:
+            ab = bytes([addr>>8, addr&0xFF]); t = 'S1'
+        elif addr <= 0xFFFFFF:
+            ab = bytes([addr>>16, (addr>>8)&0xFF, addr&0xFF]); t = 'S2'
+        else:
+            ab = bytes([addr>>24,(addr>>16)&0xFF,(addr>>8)&0xFF,addr&0xFF]); t='S3'
+        rec = bytes([len(ab)+len(chunk)+1]) + ab + chunk
+        lines.append(t + rec.hex().upper() + f'{(-sum(rec))&0xFF:02X}')
+    lines.append('S9030000FC')
+    return '\n'.join(lines)
+
+def _to_c_array(data: bytes, name: str = 'rom') -> str:
+    lines = [f'const uint8_t {name}[{len(data)}] = {{']
+    for i in range(0, len(data), 16):
+        chunk = data[i:i+16]
+        row = ', '.join(f'0x{b:02X}' for b in chunk)
+        lines.append(f'    {row},')
+    lines.append('};')
+    return '\n'.join(lines)
+
+def _to_python(data: bytes, name: str = 'rom') -> str:
+    lines = [f'{name} = bytes([']
+    for i in range(0, len(data), 16):
+        chunk = data[i:i+16]
+        row = ', '.join(f'0x{b:02X}' for b in chunk)
+        lines.append(f'    {row},')
+    lines.append('])')
+    return '\n'.join(lines)
+
+
+# ── Entropy view ───────────────────────────────────────────────────────────
+
+class EntropyView(Gtk.Box):
+    """Bar chart of per-block Shannon entropy."""
+
+    BLOCK_SIZES = [64, 128, 256, 512, 1024]
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._data: bytes = b''
+        self._hover_x: float = -1
+
+        ctrl = Gtk.Box(spacing=8, margin_start=8, margin_end=8,
+                       margin_top=4, margin_bottom=4)
+        ctrl.append(Gtk.Label(label='Block size:'))
+        self._block_drop = Gtk.DropDown(
+            model=Gtk.StringList.new([str(s) for s in self.BLOCK_SIZES]))
+        self._block_drop.set_selected(2)   # 256 bytes default
+        self._block_drop.connect('notify::selected',
+                                 lambda *_: self._area.queue_draw())
+        ctrl.append(self._block_drop)
+
+        # Legend
+        for label, color in [('Low/blank','#3359e5'),
+                              ('Code/data','#33cc55'),
+                              ('Compressed/encrypted','#e53333')]:
+            dot = Gtk.Label()
+            dot.set_markup(f'<span foreground="{color}">■</span> {label}')
+            ctrl.append(dot)
+
+        self._info = Gtk.Label(label='', xalign=0, hexpand=True,
+                               css_classes=['dim-label'])
+        ctrl.append(self._info)
+        self.append(ctrl)
+        self.append(Gtk.Separator())
+
+        self._area = Gtk.DrawingArea(vexpand=True, hexpand=True)
+        self._area.set_draw_func(self._draw)
+
+        motion = Gtk.EventControllerMotion()
+        motion.connect('motion', self._on_motion)
+        motion.connect('leave', self._on_leave)
+        self._area.add_controller(motion)
+
+        self.append(self._area)
+
+    def update(self, data: bytes):
+        self._data = data
+        self._area.queue_draw()
+
+    def _on_motion(self, ctrl, x, y):
+        self._hover_x = x
+        self._area.queue_draw()
+
+    def _on_leave(self, ctrl):
+        self._hover_x = -1
+        self._info.set_text('')
+        self._area.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        # Background
+        cr.set_source_rgb(0.08, 0.08, 0.08)
+        cr.rectangle(0, 0, w, h)
+        cr.fill()
+
+        if not self._data:
+            return
+
+        bsz = self.BLOCK_SIZES[self._block_drop.get_selected()]
+        blocks = [self._data[i:i+bsz]
+                  for i in range(0, len(self._data), bsz)]
+        entropies = [_block_entropy(b) for b in blocks]
+        n = len(entropies)
+        if n == 0:
+            return
+
+        bw = w / n
+        for i, e in enumerate(entropies):
+            bh = (e / 8.0) * (h - 20)
+            r, g, b = _entropy_color(e)
+            cr.set_source_rgb(r, g, b)
+            cr.rectangle(i * bw, h - 20 - bh, max(bw - 1, 1), bh)
+            cr.fill()
+
+        # X-axis tick labels (every ~64 blocks)
+        cr.set_source_rgb(0.5, 0.5, 0.5)
+        cr.set_font_size(9)
+        step = max(1, n // 8)
+        for i in range(0, n, step):
+            x = i * bw
+            cr.move_to(x + 2, h - 4)
+            cr.show_text(f'{i*bsz:X}')
+
+        # Hover info
+        if 0 <= self._hover_x <= w:
+            idx = int(self._hover_x / bw)
+            if idx < n:
+                e = entropies[idx]
+                offset = idx * bsz
+                self._info.set_text(
+                    f'Offset {offset:#010x}  block {idx}  '
+                    f'entropy {e:.3f} bits/byte')
+                # Vertical cursor
+                cr.set_source_rgba(1, 1, 1, 0.3)
+                cr.rectangle(idx * bw, 0, max(bw, 1), h - 20)
+                cr.fill()
+
+
+# ── Histogram view ─────────────────────────────────────────────────────────
+
+class HistogramView(Gtk.Box):
+    """Bar chart of byte value frequency (all 256 values)."""
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._data: bytes = b''
+        self._hover_x: float = -1
+
+        ctrl = Gtk.Box(spacing=8, margin_start=8, margin_end=8,
+                       margin_top=4, margin_bottom=4)
+        self._log_btn = Gtk.ToggleButton(label='Log scale')
+        self._log_btn.connect('toggled', lambda *_: self._area.queue_draw())
+        ctrl.append(self._log_btn)
+
+        for label, color in [('0x00','#3359e5'), ('Printable','#33cc55'),
+                              ('0xFF','#e53333'), ('Other','#888888')]:
+            dot = Gtk.Label()
+            dot.set_markup(f'<span foreground="{color}">■</span> {label}')
+            ctrl.append(dot)
+
+        self._info = Gtk.Label(label='', xalign=0, hexpand=True,
+                               css_classes=['dim-label'])
+        ctrl.append(self._info)
+        self.append(ctrl)
+        self.append(Gtk.Separator())
+
+        self._area = Gtk.DrawingArea(vexpand=True, hexpand=True)
+        self._area.set_draw_func(self._draw)
+
+        motion = Gtk.EventControllerMotion()
+        motion.connect('motion', self._on_motion)
+        motion.connect('leave', self._on_leave)
+        self._area.add_controller(motion)
+
+        self.append(self._area)
+
+    def update(self, data: bytes):
+        self._data = data
+        self._area.queue_draw()
+
+    def _on_motion(self, ctrl, x, y):
+        self._hover_x = x
+        self._area.queue_draw()
+
+    def _on_leave(self, ctrl):
+        self._hover_x = -1
+        self._info.set_text('')
+        self._area.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        cr.set_source_rgb(0.08, 0.08, 0.08)
+        cr.rectangle(0, 0, w, h)
+        cr.fill()
+
+        if not self._data:
+            return
+
+        counts = [0] * 256
+        for b in self._data:
+            counts[b] += 1
+
+        log_scale = self._log_btn.get_active()
+        max_c = max(counts) or 1
+        chart_h = h - 20
+
+        bw = w / 256
+        for i, c in enumerate(counts):
+            if c == 0:
+                continue
+            norm = (math.log1p(c) / math.log1p(max_c)) if log_scale else (c / max_c)
+            bh = norm * chart_h
+            if i == 0x00:
+                r, g, b = 0.2, 0.3, 0.9
+            elif i == 0xFF:
+                r, g, b = 0.9, 0.2, 0.2
+            elif 0x20 <= i <= 0x7E:
+                r, g, b = 0.2, 0.8, 0.3
+            else:
+                r, g, b = 0.55, 0.55, 0.55
+            cr.set_source_rgb(r, g, b)
+            cr.rectangle(i * bw, h - 20 - bh, max(bw - 0.5, 0.5), bh)
+            cr.fill()
+
+        # X-axis labels every 16 bytes
+        cr.set_source_rgb(0.5, 0.5, 0.5)
+        cr.set_font_size(9)
+        for i in range(0, 256, 16):
+            cr.move_to(i * bw + 1, h - 4)
+            cr.show_text(f'{i:02X}')
+
+        # Hover
+        if 0 <= self._hover_x <= w:
+            idx = min(int(self._hover_x / bw), 255)
+            c = counts[idx]
+            pct = c / len(self._data) * 100 if self._data else 0
+            self._info.set_text(
+                f'Byte 0x{idx:02X} ({idx:3d})  '
+                f'count {c:,}  ({pct:.2f}%)')
+            cr.set_source_rgba(1, 1, 1, 0.25)
+            cr.rectangle(idx * bw, 0, max(bw, 1), chart_h)
+            cr.fill()
+
+
+# ── Disassembler view ──────────────────────────────────────────────────────
+
+class DisasmView(Gtk.Box):
+    """Disassembles the buffer for a selectable architecture."""
+
+    ARCHS = ['6502', '65C02', '8086 (16-bit)', 'x86 (32-bit)']
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._data: bytes = b''
+
+        ctrl = Gtk.Box(spacing=8, margin_start=8, margin_end=8,
+                       margin_top=4, margin_bottom=4)
+        ctrl.append(Gtk.Label(label='Architecture:'))
+        self._arch_drop = Gtk.DropDown(
+            model=Gtk.StringList.new(self.ARCHS))
+        ctrl.append(self._arch_drop)
+
+        ctrl.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        ctrl.append(Gtk.Label(label='Start offset:'))
+        self._offset_entry = Gtk.Entry(
+            text='0', max_width_chars=10, width_chars=10,
+            tooltip_text='Hex offset into buffer')
+        ctrl.append(self._offset_entry)
+
+        ctrl.append(Gtk.Label(label='Bytes:'))
+        self._len_entry = Gtk.Entry(
+            text='256', max_width_chars=8, width_chars=8,
+            tooltip_text='Number of bytes to disassemble (decimal)')
+        ctrl.append(self._len_entry)
+
+        go_btn = Gtk.Button(label='Disassemble')
+        go_btn.connect('clicked', self._on_go)
+        ctrl.append(go_btn)
+
+        self._status = Gtk.Label(label='', xalign=0, hexpand=True,
+                                 css_classes=['dim-label'])
+        ctrl.append(self._status)
+        self.append(ctrl)
+        self.append(Gtk.Separator())
+
+        self._store = Gtk.ListStore(str, str, str)
+        tv = Gtk.TreeView(model=self._store)
+        tv.set_headers_visible(True)
+        tv.set_enable_search(False)
+        tv.add_css_class('hex-view')
+
+        for title, idx, w in [('Offset',0,80), ('Bytes',1,140), ('Assembly',2,-1)]:
+            r = Gtk.CellRendererText()
+            c = Gtk.TreeViewColumn(title, r, text=idx)
+            c.set_resizable(True)
+            if w > 0:
+                c.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+                c.set_fixed_width(w)
+            else:
+                c.set_expand(True)
+            tv.append_column(c)
+
+        scroll = Gtk.ScrolledWindow(
+            vexpand=True, hexpand=True,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            hscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+        )
+        scroll.set_child(tv)
+        self.append(scroll)
+
+    def update(self, data: bytes):
+        self._data = data
+        self._store.clear()
+        self._status.set_text('')
+
+    def _on_go(self, _btn):
+        if not self._data:
+            self._status.set_text('No data loaded.')
+            return
+        try:
+            offset = int(self._offset_entry.get_text().strip(), 16)
+            length = int(self._len_entry.get_text().strip(), 10)
+        except ValueError:
+            self._status.set_text('Invalid offset or length.')
+            return
+
+        chunk = self._data[offset:offset+length]
+        if not chunk:
+            self._status.set_text('Offset out of range.')
+            return
+
+        arch = self.ARCHS[self._arch_drop.get_selected()]
+        if arch == '6502':
+            rows = _disasm_6502(chunk, offset, False)
+        elif arch == '65C02':
+            rows = _disasm_6502(chunk, offset, True)
+        elif arch == '8086 (16-bit)':
+            rows = _disasm_ndisasm(chunk, offset, 16)
+            if not rows:
+                self._status.set_text('ndisasm not found — install nasm.')
+                return
+        else:
+            rows = _disasm_ndisasm(chunk, offset, 32)
+            if not rows:
+                self._status.set_text('ndisasm not found — install nasm.')
+                return
+
+        self._store.clear()
+        for addr, raw, asm in rows:
+            self._store.append([f'{addr:08X}', raw, asm])
+        self._status.set_text(f'{len(rows)} instructions')
+
+
+# ── Export view ────────────────────────────────────────────────────────────
+
+class ExportView(Gtk.Box):
+    """Convert and save the buffer in various formats."""
+
+    FORMATS = ['Intel HEX', 'Motorola S-Record', 'C Array', 'Python bytes']
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._data: bytes = b''
+
+        ctrl = Gtk.Box(spacing=8, margin_start=8, margin_end=8,
+                       margin_top=4, margin_bottom=4)
+        ctrl.append(Gtk.Label(label='Format:'))
+        self._fmt_drop = Gtk.DropDown(
+            model=Gtk.StringList.new(self.FORMATS))
+        self._fmt_drop.connect('notify::selected', self._on_settings)
+        ctrl.append(self._fmt_drop)
+
+        ctrl.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        ctrl.append(Gtk.Label(label='Base address:'))
+        self._base_entry = Gtk.Entry(
+            text='0000', max_width_chars=10, width_chars=10)
+        self._base_entry.connect('changed', self._on_settings)
+        ctrl.append(self._base_entry)
+
+        ctrl.append(Gtk.Label(label='Variable name:'))
+        self._name_entry = Gtk.Entry(
+            text='rom', max_width_chars=12, width_chars=12)
+        self._name_entry.connect('changed', self._on_settings)
+        ctrl.append(self._name_entry)
+
+        save_btn = Gtk.Button(label='Save…')
+        save_btn.connect('clicked', self._on_save)
+        ctrl.append(save_btn)
+
+        clip_btn = Gtk.Button(label='Copy')
+        clip_btn.connect('clicked', self._on_copy)
+        ctrl.append(clip_btn)
+
+        self.append(ctrl)
+        self.append(Gtk.Separator())
+
+        self._preview = Gtk.TextView(
+            editable=False, monospace=True,
+            left_margin=6, right_margin=6, top_margin=6, bottom_margin=6,
+            vexpand=True, hexpand=True,
+        )
+        self._preview_buf = self._preview.get_buffer()
+        scroll = Gtk.ScrolledWindow(
+            vexpand=True, hexpand=True,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            hscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+        )
+        scroll.set_child(self._preview)
+        self.append(scroll)
+
+    def update(self, data: bytes):
+        self._data = data
+        self._refresh_preview()
+
+    def _on_settings(self, *_):
+        self._refresh_preview()
+
+    def _get_text(self) -> str:
+        if not self._data:
+            return ''
+        try:
+            base = int(self._base_entry.get_text().strip() or '0', 16)
+        except ValueError:
+            base = 0
+        name = self._name_entry.get_text().strip() or 'rom'
+        fmt = self.FORMATS[self._fmt_drop.get_selected()]
+        if fmt == 'Intel HEX':
+            return _to_intel_hex(self._data, base)
+        elif fmt == 'Motorola S-Record':
+            return _to_srec(self._data, base)
+        elif fmt == 'C Array':
+            return _to_c_array(self._data, name)
+        else:
+            return _to_python(self._data, name)
+
+    def _refresh_preview(self):
+        text = self._get_text()
+        # Show first 100 lines in preview
+        lines = text.splitlines()
+        preview = '\n'.join(lines[:100])
+        if len(lines) > 100:
+            preview += f'\n... ({len(lines)-100} more lines)'
+        self._preview_buf.set_text(preview)
+
+    def _on_save(self, _btn):
+        fmt = self.FORMATS[self._fmt_drop.get_selected()]
+        ext = {
+            'Intel HEX': '.hex', 'Motorola S-Record': '.srec',
+            'C Array': '.c', 'Python bytes': '.py',
+        }[fmt]
+        dlg = Gtk.FileDialog(title='Save export')
+        dlg.set_initial_name(f'rom{ext}')
+        root = self.get_root()
+        dlg.save(root if isinstance(root, Gtk.Window) else None,
+                 None, self._save_cb)
+
+    def _save_cb(self, dlg, result):
+        try:
+            path = dlg.save_finish(result).get_path()
+            with open(path, 'w') as f:
+                f.write(self._get_text())
+        except Exception:
+            pass
+
+    def _on_copy(self, _btn):
+        text = self._get_text()
+        display = Gdk.Display.get_default()
+        display.get_clipboard().set(text)
 
 
 # ── Device info panel ──────────────────────────────────────────────────────
@@ -307,9 +962,10 @@ class HexView(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self._data: bytes = b''
         self._cmp_data: bytes = b''
-        self._diff_rows: list[set] = []   # per-row sets of differing byte indices
+        self._diff_rows: list[set] = []
         self._mode_16bit: bool = False
         self._on_data_loaded = on_data_loaded
+        self._file_path: str = ''
 
         # ── controls row ──────────────────────────────────────────────
         ctrl = Gtk.Box(spacing=6,
@@ -344,6 +1000,11 @@ class HexView(Gtk.Box):
         self._clear_cmp_btn.set_visible(False)
         self._clear_cmp_btn.connect('clicked', self._on_clear_compare)
         ctrl.append(self._clear_cmp_btn)
+
+        edit_btn = Gtk.Button(label='Edit Buffer…',
+                              tooltip_text='Fill ranges or patch individual bytes')
+        edit_btn.connect('clicked', self._on_edit)
+        ctrl.append(edit_btn)
 
         self._info_lbl = Gtk.Label(
             label='No data loaded', xalign=0, hexpand=True,
@@ -485,6 +1146,7 @@ class HexView(Gtk.Box):
     def load_file(self, path: str):
         try:
             with open(path, 'rb') as fh:
+                self._file_path = path
                 self.load_bytes(fh.read())
         except Exception as exc:
             self._info_lbl.set_text(f'Error loading file: {exc}')
@@ -496,6 +1158,126 @@ class HexView(Gtk.Box):
         self._refresh()
         if self._on_data_loaded:
             self._on_data_loaded(data)
+
+    # ── edit buffer ────────────────────────────────────────────────────
+
+    def _on_edit(self, _btn):
+        root = self.get_root()
+        dlg = Gtk.Window(
+            title='Edit Buffer',
+            transient_for=root if isinstance(root, Gtk.Window) else None,
+            modal=True, default_width=380,
+        )
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                      margin_start=12, margin_end=12,
+                      margin_top=12, margin_bottom=12)
+        dlg.set_child(box)
+
+        # Fill range
+        box.append(Gtk.Label(label='Fill Range', xalign=0,
+                             attributes=self._bold_attrs()))
+        fg = Gtk.Grid(row_spacing=6, column_spacing=8)
+        fg.attach(Gtk.Label(label='Start (hex):', xalign=1), 0, 0, 1, 1)
+        start_e = Gtk.Entry(text='00000000', max_width_chars=10, width_chars=10)
+        fg.attach(start_e, 1, 0, 1, 1)
+        fg.attach(Gtk.Label(label='End (hex):', xalign=1), 0, 1, 1, 1)
+        end_e = Gtk.Entry(text='00000010', max_width_chars=10, width_chars=10)
+        fg.attach(end_e, 1, 1, 1, 1)
+        fg.attach(Gtk.Label(label='Value (hex):', xalign=1), 0, 2, 1, 1)
+        fill_e = Gtk.Entry(text='FF', max_width_chars=4, width_chars=4)
+        fg.attach(fill_e, 1, 2, 1, 1)
+        fill_btn = Gtk.Button(label='Apply Fill',
+                              css_classes=['suggested-action'],
+                              halign=Gtk.Align.END)
+        fg.attach(fill_btn, 1, 3, 1, 1)
+        box.append(fg)
+
+        box.append(Gtk.Separator())
+
+        # Patch byte
+        box.append(Gtk.Label(label='Patch Byte', xalign=0,
+                             attributes=self._bold_attrs()))
+        pg = Gtk.Grid(row_spacing=6, column_spacing=8)
+        pg.attach(Gtk.Label(label='Offset (hex):', xalign=1), 0, 0, 1, 1)
+        poff_e = Gtk.Entry(text='00000000', max_width_chars=10, width_chars=10)
+        pg.attach(poff_e, 1, 0, 1, 1)
+        pg.attach(Gtk.Label(label='Value (hex):', xalign=1), 0, 1, 1, 1)
+        pval_e = Gtk.Entry(text='00', max_width_chars=4, width_chars=4)
+        pg.attach(pval_e, 1, 1, 1, 1)
+        patch_btn = Gtk.Button(label='Apply Patch',
+                               css_classes=['suggested-action'],
+                               halign=Gtk.Align.END)
+        pg.attach(patch_btn, 1, 2, 1, 1)
+        box.append(pg)
+
+        box.append(Gtk.Separator())
+
+        save_btn = Gtk.Button(label='Save Buffer to File…')
+        save_btn.connect('clicked', lambda _: self._save_buffer(dlg))
+        box.append(save_btn)
+
+        status = Gtk.Label(label='', xalign=0, css_classes=['dim-label'])
+        box.append(status)
+
+        def do_fill(_btn):
+            try:
+                s = int(start_e.get_text().strip(), 16)
+                e = int(end_e.get_text().strip(), 16)
+                v = int(fill_e.get_text().strip(), 16)
+                assert 0 <= v <= 0xFF
+                assert 0 <= s <= e < len(self._data)
+            except Exception:
+                status.set_text('Invalid fill parameters.')
+                return
+            buf = bytearray(self._data)
+            buf[s:e+1] = bytes([v] * (e - s + 1))
+            self._data = bytes(buf)
+            self._refresh()
+            if self._on_data_loaded:
+                self._on_data_loaded(self._data)
+            status.set_text(f'Filled {e-s+1} bytes with 0x{v:02X}')
+
+        def do_patch(_btn):
+            try:
+                off = int(poff_e.get_text().strip(), 16)
+                val = int(pval_e.get_text().strip(), 16)
+                assert 0 <= val <= 0xFF
+                assert 0 <= off < len(self._data)
+            except Exception:
+                status.set_text('Invalid patch parameters.')
+                return
+            buf = bytearray(self._data)
+            buf[off] = val
+            self._data = bytes(buf)
+            self._refresh()
+            if self._on_data_loaded:
+                self._on_data_loaded(self._data)
+            status.set_text(f'Patched offset 0x{off:X} → 0x{val:02X}')
+
+        fill_btn.connect('clicked', do_fill)
+        patch_btn.connect('clicked', do_patch)
+        dlg.present()
+
+    def _save_buffer(self, parent):
+        dlg = Gtk.FileDialog(title='Save buffer')
+        if self._file_path:
+            dlg.set_initial_name(os.path.basename(self._file_path))
+        dlg.save(parent, None, self._save_buffer_cb)
+
+    def _save_buffer_cb(self, dlg, result):
+        try:
+            path = dlg.save_finish(result).get_path()
+            with open(path, 'wb') as f:
+                f.write(self._data)
+            self._file_path = path
+        except Exception:
+            pass
+
+    @staticmethod
+    def _bold_attrs():
+        attrs = Pango.AttrList()
+        attrs.insert(Pango.attr_weight_new(Pango.Weight.BOLD))
+        return attrs
 
     # ── diff computation ───────────────────────────────────────────────
 
@@ -897,7 +1679,27 @@ class MiniproApp(Gtk.Application):
         self._notebook.append_page(self._strings_view,
                                    Gtk.Label(label='Strings'))
 
-        # Tab 3 — Log
+        # Tab 3 — Entropy
+        self._entropy_view = EntropyView()
+        self._notebook.append_page(self._entropy_view,
+                                   Gtk.Label(label='Entropy'))
+
+        # Tab 4 — Histogram
+        self._histogram_view = HistogramView()
+        self._notebook.append_page(self._histogram_view,
+                                   Gtk.Label(label='Histogram'))
+
+        # Tab 5 — Disassembler
+        self._disasm_view = DisasmView()
+        self._notebook.append_page(self._disasm_view,
+                                   Gtk.Label(label='Disasm'))
+
+        # Tab 6 — Export
+        self._export_view = ExportView()
+        self._notebook.append_page(self._export_view,
+                                   Gtk.Label(label='Export'))
+
+        # Tab 7 — Log
         log_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self._scroll = Gtk.ScrolledWindow(
             vexpand=True,
@@ -927,6 +1729,10 @@ class MiniproApp(Gtk.Application):
         device = self._dev_entry.get_text().strip()
         self._dev_info.update(device, data)
         self._strings_view.update(data)
+        self._entropy_view.update(data)
+        self._histogram_view.update(data)
+        self._disasm_view.update(data)
+        self._export_view.update(data)
 
     def _base_cmd(self):
         cmd = [self.minipro]
@@ -1175,7 +1981,7 @@ class MiniproApp(Gtk.Application):
         self._progress.set_fraction(0.0)
         self._progress.set_text('')
         self._progress.set_visible(True)
-        self._notebook.set_current_page(3)   # Log tab while running
+        self._notebook.set_current_page(7)   # Log tab while running
         self._log(f'\n$ {" ".join(cmd)}\n')
         threading.Thread(target=self._run_cmd, args=(cmd,), daemon=True).start()
 
