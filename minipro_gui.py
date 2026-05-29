@@ -10,6 +10,7 @@ import shutil
 import os
 import re
 import zlib
+import json
 
 APP_ID = 'org.minipro.gui'
 
@@ -42,6 +43,10 @@ treeview.hex-view column header button label {
 """
 
 MAX_HEX_ROWS = 65536   # cap at 1 MB displayed
+
+_CONFIG_PATH = os.path.join(
+    GLib.get_user_config_dir(), 'minipro-gui', 'config.json'
+)
 
 
 def find_minipro():
@@ -767,6 +772,7 @@ class MiniproApp(Gtk.Application):
 
         root.append(self._notebook)
 
+        self._load_config()
         self._update_preview()
 
     def _on_hex_data_loaded(self, data: bytes):
@@ -963,21 +969,48 @@ class MiniproApp(Gtk.Application):
 
         return cmd
 
+    def _load_config(self):
+        try:
+            with open(_CONFIG_PATH) as f:
+                cfg = json.load(f)
+            if cfg.get('device'):
+                self._dev_entry.set_text(cfg['device'])
+            if cfg.get('file'):
+                self._file_entry.set_text(cfg['file'])
+            if 'operation' in cfg:
+                self._op_drop.set_selected(cfg['operation'])
+        except Exception:
+            pass
+
+    def _save_config(self):
+        cfg = {
+            'device':    self._dev_entry.get_text().strip(),
+            'file':      self._file_entry.get_text().strip(),
+            'operation': self._op_drop.get_selected(),
+        }
+        try:
+            os.makedirs(os.path.dirname(_CONFIG_PATH), exist_ok=True)
+            with open(_CONFIG_PATH, 'w') as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+
     def _update_preview(self, *_):
         cmd = self._build_cmd()
         if not cmd:
             self._cmd_lbl.set_text('')
-            return
-        display, skip = [], False
-        for tok in cmd:
-            if skip:
-                skip = False
-                continue
-            if tok in ('--infoic', '--logicic'):
-                skip = True
-                continue
-            display.append(tok)
-        self._cmd_lbl.set_text('$ ' + ' '.join(display))
+        else:
+            display, skip = [], False
+            for tok in cmd:
+                if skip:
+                    skip = False
+                    continue
+                if tok in ('--infoic', '--logicic'):
+                    skip = True
+                    continue
+                display.append(tok)
+            self._cmd_lbl.set_text('$ ' + ' '.join(display))
+        self._save_config()
 
     # ── run / stop ─────────────────────────────────────────────────────
 
