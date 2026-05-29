@@ -1,0 +1,13 @@
+# makepkg artifacts
+src/
+pkg/
+*.pkg.tar.zst
+*.pkg.tar.xz
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
+*.swp

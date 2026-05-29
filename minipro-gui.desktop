@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=minipro GUI
+Comment=Read, write and verify EPROMs and flash chips with TL866II+, T48, T56
+Exec=minipro-gui
+Icon=minipro-gui
+Terminal=false
+Type=Application
+Categories=Electronics;Utility;
+Keywords=EPROM;programmer;TL866;minipro;flash;chip;

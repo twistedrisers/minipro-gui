@@ -1,0 +1,11 @@
+post_install() {
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger 2>/dev/null || true
+    echo "  -> Plug the programmer in (or replug it) to apply udev rules."
+    echo "  -> Your user may need to be in the 'plugdev' group:"
+    echo "       sudo usermod -aG plugdev \$USER"
+}
+
+post_upgrade() {
+    post_install
+}

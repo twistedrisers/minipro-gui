@@ -1,0 +1,3 @@
+[submodule "minipro"]
+	path = minipro
+	url = https://gitlab.com/DavidGriffith/minipro.git
