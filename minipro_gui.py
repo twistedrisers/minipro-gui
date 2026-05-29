@@ -153,6 +153,149 @@ class DeviceInfoView(Gtk.Box):
         )
 
 
+# ── Strings view ──────────────────────────────────────────────────────────
+
+class StringsView(Gtk.Box):
+    """Extracts and displays printable strings from the loaded buffer."""
+
+    MIN_LEN_DEFAULT = 4
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._data: bytes = b''
+
+        # ── controls ──────────────────────────────────────────────────
+        ctrl = Gtk.Box(spacing=8,
+                       margin_start=8, margin_end=8,
+                       margin_top=4, margin_bottom=4)
+
+        ctrl.append(Gtk.Label(label='Min length:'))
+
+        self._min_spin = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=self.MIN_LEN_DEFAULT,
+                lower=1, upper=256, step_increment=1, page_increment=4,
+            ),
+            numeric=True, digits=0,
+        )
+        self._min_spin.connect('value-changed', self._on_settings_changed)
+        ctrl.append(self._min_spin)
+
+        ctrl.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+
+        self._filter_entry = Gtk.SearchEntry(
+            placeholder_text='Filter strings…', hexpand=True)
+        self._filter_entry.connect('search-changed', self._on_filter_changed)
+        ctrl.append(self._filter_entry)
+
+        self._count_lbl = Gtk.Label(
+            label='', xalign=1.0, css_classes=['dim-label'])
+        ctrl.append(self._count_lbl)
+
+        self.append(ctrl)
+        self.append(Gtk.Separator())
+
+        # ── list store: offset (str), length (str), string (str) ──────
+        self._store = Gtk.ListStore(str, str, str)
+
+        self._filter_model = self._store.filter_new()
+        self._filter_model.set_visible_func(self._row_visible)
+
+        tv = Gtk.TreeView(model=self._filter_model)
+        tv.set_headers_visible(True)
+        tv.set_enable_search(False)
+        tv.add_css_class('hex-view')   # reuse monospace CSS
+
+        cols = [
+            ('Offset',  0, 80,  0.0),
+            ('Length',  1, 50,  1.0),
+            ('String',  2, -1,  0.0),
+        ]
+        for title, col_idx, width, xalign in cols:
+            r = Gtk.CellRendererText()
+            r.set_property('xalign', xalign)
+            c = Gtk.TreeViewColumn(title, r, text=col_idx)
+            c.set_resizable(True)
+            if width > 0:
+                c.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+                c.set_fixed_width(width)
+            else:
+                c.set_expand(True)
+            tv.append_column(c)
+
+        scroll = Gtk.ScrolledWindow(
+            vexpand=True, hexpand=True,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            hscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+        )
+        scroll.set_child(tv)
+        self.append(scroll)
+
+    # ── filtering ──────────────────────────────────────────────────────
+
+    def _row_visible(self, model, it, _):
+        needle = self._filter_entry.get_text().lower()
+        if not needle:
+            return True
+        return needle in model.get_value(it, 2).lower()
+
+    def _on_filter_changed(self, _entry):
+        self._filter_model.refilter()
+        self._update_count()
+
+    def _on_settings_changed(self, _spin):
+        self._refresh()
+
+    # ── data loading ───────────────────────────────────────────────────
+
+    def update(self, data: bytes):
+        self._data = data
+        self._refresh()
+
+    def _refresh(self):
+        self._store.clear()
+        self._count_lbl.set_text('')
+        if not self._data:
+            return
+
+        min_len = int(self._min_spin.get_value())
+        strings = list(self._extract(self._data, min_len))
+
+        for offset, s in strings:
+            self._store.append([f'{offset:08X}', str(len(s)), s])
+
+        self._update_count()
+
+    def _update_count(self):
+        total = len(self._store)
+        visible = self._filter_model.iter_n_children(None)
+        if self._filter_entry.get_text():
+            self._count_lbl.set_text(f'{visible} of {total} strings')
+        else:
+            self._count_lbl.set_text(f'{total} strings')
+
+    @staticmethod
+    def _extract(data: bytes, min_len: int):
+        """Yield (offset, string) for every printable ASCII run >= min_len bytes."""
+        start = None
+        for i, b in enumerate(data):
+            if 0x20 <= b < 0x7F or b in (0x09, 0x0A, 0x0D):  # printable + tab/LF/CR
+                if start is None:
+                    start = i
+            else:
+                if start is not None:
+                    s = data[start:i].decode('ascii', errors='replace')
+                    s = s.replace('\t', '→').replace('\n', '↵').replace('\r', '')
+                    if len(s.strip()) >= min_len:
+                        yield start, s.rstrip()
+                    start = None
+        if start is not None:
+            s = data[start:].decode('ascii', errors='replace')
+            s = s.replace('\t', '→').replace('\n', '↵').replace('\r', '')
+            if len(s.strip()) >= min_len:
+                yield start, s.rstrip()
+
+
 # ── Hex viewer widget ──────────────────────────────────────────────────────
 
 class HexView(Gtk.Box):
@@ -749,7 +892,12 @@ class MiniproApp(Gtk.Application):
         self._notebook.append_page(dev_info_scroll,
                                    Gtk.Label(label='Device Info'))
 
-        # Tab 2 — Log
+        # Tab 2 — Strings
+        self._strings_view = StringsView()
+        self._notebook.append_page(self._strings_view,
+                                   Gtk.Label(label='Strings'))
+
+        # Tab 3 — Log
         log_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self._scroll = Gtk.ScrolledWindow(
             vexpand=True,
@@ -778,6 +926,7 @@ class MiniproApp(Gtk.Application):
     def _on_hex_data_loaded(self, data: bytes):
         device = self._dev_entry.get_text().strip()
         self._dev_info.update(device, data)
+        self._strings_view.update(data)
 
     def _base_cmd(self):
         cmd = [self.minipro]
@@ -1026,7 +1175,7 @@ class MiniproApp(Gtk.Application):
         self._progress.set_fraction(0.0)
         self._progress.set_text('')
         self._progress.set_visible(True)
-        self._notebook.set_current_page(2)   # Log tab while running
+        self._notebook.set_current_page(3)   # Log tab while running
         self._log(f'\n$ {" ".join(cmd)}\n')
         threading.Thread(target=self._run_cmd, args=(cmd,), daemon=True).start()
 
@@ -1074,7 +1223,7 @@ class MiniproApp(Gtk.Application):
         # Auto-load hex view on successful Read
         if rc == 0 and self._last_op == 'Read' and self._last_file:
             self._hex_view.load_file(self._last_file)
-            self._notebook.set_current_page(0)   # Hex View
+            self._notebook.set_current_page(0)   # Hex View tab
 
     def _hide_progress(self):
         self._progress.set_visible(False)
