@@ -2,6 +2,8 @@
 
 A GTK 4 graphical front-end for the [minipro](https://gitlab.com/DavidGriffith/minipro) open-source chip programmer tool, supporting the TL866A/CS, TL866II+, T48, T56, and T76 programmers.
 
+![minipro-gui screenshot](screenshot.png)
+
 ## Features
 
 - **Read / Write / Verify / Erase / Blank Check / Read ID** — full operation support with a real-time progress bar
