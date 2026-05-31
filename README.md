@@ -1,6 +1,6 @@
 # minipro-gui
 
-A GTK 4 graphical front-end for the [minipro](https://gitlab.com/DavidGriffith/minipro) open-source chip programmer tool, supporting the TL866A/CS, TL866II+, T48, T56, and T76 programmers.
+A GTK 4 graphical front-end for the [minipro](https://gitlab.com/DavidGriffith/minipro) open-source chip programmer tool, supporting the TL866A/CS, TL866II+, T48, T56, and T76 programmers. Claude coded UI stuff, some of the tool and added comments.
 
 ![minipro-gui screenshot](screenshot.png)
 
