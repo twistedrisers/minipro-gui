@@ -94,7 +94,7 @@ def _block_entropy(block: bytes) -> float:
     for c in counts:
         if c:
             p = c / n
-            h -= p * math.log2(p)
+            h -= p * math.log2(p)  # Shannon entropy: H = -Σ p·log₂(p), result in bits/byte
     return h
 
 def _entropy_color(e: float):
@@ -179,6 +179,8 @@ _65C02_EXTRA: dict[int, tuple[str, str, int]] = {
 def _fmt_6502(mn: str, mode: str, raw: bytes, pc: int) -> str:
     o = raw[1] if len(raw) > 1 else 0
     w = (raw[1] | raw[2] << 8) if len(raw) > 2 else 0
+    # Branch offset is relative to the instruction *after* the branch (pc+2);
+    # treat the unsigned byte as signed by subtracting 256 if >= 128.
     rel = pc + 2 + (o if o < 128 else o - 256)
     return {
         'imp': mn,
@@ -253,7 +255,7 @@ def _to_intel_hex(data: bytes, base: int = 0) -> str:
         chunk = data[i:i+bpl]
         addr = (base + i) & 0xFFFF
         rec = [len(chunk), addr >> 8, addr & 0xFF, 0x00] + list(chunk)
-        cs = (-sum(rec)) & 0xFF
+        cs = (-sum(rec)) & 0xFF  # two's complement: record bytes + checksum sum to 0x00 mod 256
         lines.append(':' + ''.join(f'{b:02X}' for b in rec) + f'{cs:02X}')
     lines.append(':00000001FF')
     return '\n'.join(lines)
@@ -266,6 +268,7 @@ def _to_srec(data: bytes, base: int = 0) -> str:
     for i in range(0, len(data), bpl):
         chunk = data[i:i+bpl]
         addr = base + i
+        # S1 = 16-bit address, S2 = 24-bit, S3 = 32-bit
         if addr <= 0xFFFF:
             ab = bytes([addr>>8, addr&0xFF]); t = 'S1'
         elif addr <= 0xFFFFFF:
@@ -1039,7 +1042,11 @@ class HexView(Gtk.Box):
     # ── column layout ──────────────────────────────────────────────────
 
     def _make_diff_func(self, byte_indices: list[int]):
-        """Cell data function that highlights cells where bytes differ."""
+        """Cell data function that highlights cells where bytes differ.
+
+        byte_indices is a list because 16-bit mode maps two source bytes to
+        one display column, so both must be checked for a diff.
+        """
         def func(col, renderer, model, it, _):
             if not self._diff_rows:
                 renderer.set_property('foreground-set', False)
@@ -1329,7 +1336,7 @@ class HexView(Gtk.Box):
             chunk = display[row_start:row_start + bpr]
 
             if self._mode_16bit:
-                word_addr = row_start >> 1
+                word_addr = row_start >> 1  # byte offset → word address (device is word-addressed)
                 addr_str = f'{word_addr >> 16:04X}-{word_addr & 0xFFFF:04X}'
             else:
                 addr_str = f'{row_start:08X}'
@@ -1448,7 +1455,7 @@ class DeviceBrowserDialog(Gtk.Window):
 
     def _on_select(self, _btn):
         pos = self._selection.get_selected()
-        if pos != 0xFFFFFFFF:
+        if pos != 0xFFFFFFFF:  # GTK_INVALID_LIST_POSITION — nothing selected
             item = self._filtered.get_item(pos)
             if item:
                 self.emit('device-selected', item.get_string())
@@ -1476,7 +1483,7 @@ class MiniproApp(Gtk.Application):
         self._apply_css()
         self._build_ui()
         self.window.present()
-        GLib.idle_add(self._detect_programmer)
+        GLib.idle_add(self._detect_programmer)  # run after the window is shown
 
     def _apply_css(self):
         provider = Gtk.CssProvider()
@@ -1756,6 +1763,8 @@ class MiniproApp(Gtk.Application):
                 f'{os.path.join(here, "minipro", "minipro")})')
             return False
         try:
+            # -k queries the connected programmer; output goes to stderr.
+            # The last non-empty line is "KEY: <model name>", e.g. "tl866ii: TL866II+".
             r = subprocess.run(
                 [self.minipro, '-k'],
                 capture_output=True, text=True, timeout=15,
@@ -1782,6 +1791,8 @@ class MiniproApp(Gtk.Application):
         if not self.minipro:
             return
         try:
+            # -V fetches firmware info (fast); do this first so the status label
+            # shows the full programmer description while -l loads the device list.
             vr = subprocess.run(
                 [self.minipro, '-V'],
                 capture_output=True, text=True, timeout=30,
@@ -1808,6 +1819,7 @@ class MiniproApp(Gtk.Application):
         if not version or not self.minipro:
             return
         try:
+            # -q <type> -l lists all supported devices for that programmer type
             r = subprocess.run(
                 self._base_cmd() + ['-q', version, '-l'],
                 capture_output=True, text=True, timeout=30,
@@ -1955,6 +1967,8 @@ class MiniproApp(Gtk.Application):
         if not cmd:
             self._cmd_lbl.set_text('')
         else:
+            # Strip --infoic/--logicic and their values: these are internal
+            # XML paths that clutter the user-facing command preview.
             display, skip = [], False
             for tok in cmd:
                 if skip:
@@ -1997,9 +2011,9 @@ class MiniproApp(Gtk.Application):
             self._proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.STDOUT,  # minipro sends progress/errors to stderr; merge into stdout
                 text=True,
-                bufsize=1,
+                bufsize=1,                 # line-buffered so progress lines appear immediately
             )
             for line in self._proc.stdout:
                 GLib.idle_add(self._log, line)
@@ -2033,7 +2047,7 @@ class MiniproApp(Gtk.Application):
 
     def _hide_progress(self):
         self._progress.set_visible(False)
-        return False
+        return False  # returning False removes this GLib.timeout_add callback
 
     def _log(self, text: str):
         # Update progress bar from minipro percentage lines
@@ -2048,7 +2062,7 @@ class MiniproApp(Gtk.Application):
         self._log_buf.insert(end, text)
         self._log_buf.move_mark(self._log_end_mark, self._log_buf.get_end_iter())
         self._log_view.scroll_mark_onscreen(self._log_end_mark)
-        return False
+        return False  # returning False removes this GLib.idle_add callback
 
 
 if __name__ == '__main__':
